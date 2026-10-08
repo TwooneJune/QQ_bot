@@ -1,183 +1,180 @@
-import sqlite3
-import math
-import os
 import json
-from nonebot import on_command
-from nonebot.rule import to_me
-from nonebot.adapters.onebot.v11 import MessageEvent, Bot, Message, MessageSegment
-from nonebot.params import ArgPlainText, CommandArg
-from nonebot.permission import SUPERUSER
+import os
+import re
+import botpy
+from botpy import logging
+from botpy.message import GroupMessage
 
-# == 配置与数据库逻辑 (保持不变) ==
-CONFIG_FILE = "config.json"
-DB_FILE = "bot_data.db"
-PAGE_SIZE = 5
+# ==================== 1. 配置参数与数据持久化 ====================
 
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        default = {"admins": [], "whitelist": []}
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(default, f, indent=4)
-        return default
-    with open(CONFIG_FILE, "r") as f:
-        return json.load(f)
+# 请在此处填入你的 QQ 开放平台开发者凭证
+APP_ID = "1905746882"         # 例如: "102030405"
+APP_SECRET = "Zn1GWm3LdwFZuFbyLj7WwMnFhAe8d8eB" # 例如: "abcdef1234567890xxxxxxxx"
 
-def save_config(config):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=4)
+# 数据保存的文件文件名
+DATA_FILE = "bot_data.json"
 
-def get_db_conn():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute('PRAGMA journal_mode=WAL;')
-    return conn
+def load_data():
+    """从 JSON 文件中读取数据，不存在则自动初始化"""
+    if not os.path.exists(DATA_FILE):
+        default_data = {
+            # ⚠️ 初始化管理员列表：请填入管理员的 OpenID/用户ID
+            "admins": [
+                "管理员OpenID_1"
+            ],
+            # 白名单用户列表 (OpenID/用户ID)
+            "whitelist": [],
+            # 评价数据格式：{"账号": [{"by": "录入者ID", "text": "评价内容"}, ...]}
+            "reviews": {}
+        }
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(default_data, f, ensure_ascii=False, indent=4)
+        return default_data
 
-def init_db():
-    conn = get_db_conn()
-    conn.execute('''CREATE TABLE IF NOT EXISTS reviews 
-                   (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                    target_id TEXT, 
-                    comment TEXT, 
-                    reviewer_id INTEGER,
-                    reviewer_name TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def get_paged_records(target_id, page=1):
-    conn = get_db_conn()
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM reviews WHERE target_id = ?', (target_id,))
-    total_count = cursor.fetchone()[0]
-    total_pages = max(1, math.ceil(total_count / PAGE_SIZE))
-    offset = (page - 1) * PAGE_SIZE
-    cursor.execute(
-        'SELECT id, comment, created_at FROM reviews WHERE target_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?',
-        (target_id, PAGE_SIZE, offset))
-    records = cursor.fetchall()
-    conn.close()
-    return records, total_pages, total_count
-
-# == 权限校验拦截器 ==
-async def check_permission(event: MessageEvent) -> bool:
-    user_id = int(event.user_id)
-    config = load_config()
-    admins = [int(a) for a in config.get("admins", [])]
-    whitelist = [int(w) for w in config.get("whitelist", [])]
-    return user_id in admins or user_id in whitelist
-
-async def check_admin(event: MessageEvent) -> bool:
-    user_id = int(event.user_id)
-    config = load_config()
-    admins = [int(a) for a in config.get("admins", [])]
-    return user_id in admins
-
-# == 业务处理器 ==
-
-# 1. 录入信息 (替代 Telegram 的 NAV_INPUT 流程)
-input_cmd = on_command("录入", rule=check_permission, priority=5)
-
-@input_cmd.got("target_id", prompt="🎯 录入模式\n请发送要录入的用户 ID:")
-async def process_target_id(target_id: str = ArgPlainText()):
-    if not target_id.lstrip('-').isdigit():
-        await input_cmd.reject("⚠️ 格式错误！请输入数字 ID (发送 '取消' 退出)")
-
-@input_cmd.got("comment", prompt="📝 请输入评价内容:")
-async def process_comment(event: MessageEvent, target_id: str = ArgPlainText(), comment: str = ArgPlainText()):
-    if comment == "取消":
-        await input_cmd.finish("已取消录入。")
-        
-    conn = get_db_conn()
-    conn.execute(
-        'INSERT INTO reviews (target_id, comment, reviewer_id, reviewer_name) VALUES (?, ?, ?, ?)',
-        (target_id, comment, event.user_id, event.sender.nickname)
-    )
-    conn.commit()
-    conn.close()
-    await input_cmd.finish(f"✅ ID: {target_id} 的记录录入成功！")
-
-
-# 2. 查询与翻页 (替代 Telegram 的 NAV_SEARCH 和 PAGE)
-search_cmd = on_command("查询", rule=check_permission, priority=5)
-
-@search_cmd.handle()
-async def handle_search_args(args: Message = CommandArg()):
-    # 允许直接使用 /查询 12345 2 (直接查第二页)
-    args_text = args.extract_plain_text().strip().split()
-    if args_text:
-        search_cmd.set_arg("search_args", args)
-
-@search_cmd.got("search_args", prompt="🔍 查询模式\n请发送要查询的 用户 ID (或带页码，如 '12345 2'):")
-async def do_search(event: MessageEvent, search_args: str = ArgPlainText()):
-    args = search_args.strip().split()
-    target_id = args[0]
-    page = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1
-
-    if not target_id.lstrip('-').isdigit():
-        await search_cmd.reject("❌ 请输入有效的数字 ID。")
-
-    records, total_pages, total_count = get_paged_records(target_id, page)
-    
-    if not records:
-        await search_cmd.finish(f"❌ ID {target_id} 暂无记录或页码超出范围。")
-
-    is_admin = await check_admin(event)
-    
-    msg = f"🔍 查询结果\nID: {target_id}\n总计: {total_count} 条\n第 {page}/{total_pages} 页\n===============\n"
-    for i, (r_id, comment, dt) in enumerate(records, 1):
-        idx = (page - 1) * PAGE_SIZE + i
-        msg += f"[{idx}] 记录号:{r_id}\n{comment}\n📅 {dt}\n\n"
-        
-    msg += "===============\n"
-    msg += f"👉 发送 /查询 {target_id} {page+1} 查看下一页"
-    if is_admin:
-        msg += "\n🗑️ 超管提示: 发送 /删除 记录号(非序号) 即可删除"
-
-    await search_cmd.finish(msg)
-
-
-# 3. 超管命令：删除
-delete_cmd = on_command("删除", rule=check_admin, priority=5)
-
-@delete_cmd.handle()
-async def handle_delete(args: Message = CommandArg()):
-    r_id = args.extract_plain_text().strip()
-    if not r_id.isdigit():
-        await delete_cmd.finish("用法: /删除 记录号 (纯数字)")
-        
-    conn = get_db_conn()
-    conn.execute('DELETE FROM reviews WHERE id = ?', (r_id,))
-    conn.commit()
-    conn.close()
-    await delete_cmd.finish(f"✅ 记录号 {r_id} 已成功删除。")
-
-
-# 4. 超管命令：添加白名单
-add_auth = on_command("add", rule=check_admin, priority=5)
-
-@add_auth.handle()
-async def handle_add(args: Message = CommandArg()):
-    cfg = load_config()
     try:
-        nid = int(args.extract_plain_text().strip())
-        if nid not in cfg["whitelist"]:
-            cfg["whitelist"].append(nid)
-            save_config(cfg)
-        await add_auth.finish(f"✅ 已授权白名单: {nid}")
-    except ValueError:
-        await add_auth.finish("用法: /add 用户ID (必须是纯数字)")
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        _log.error(f"读取数据文件失败，原因: {e}")
+        return {"admins": [], "whitelist": [], "reviews": {}}
+
+def save_data(data):
+    """保存数据到 JSON 文件，确保重启不会丢失"""
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
 
-# 5. 超管命令：查看白名单
-list_whitelist = on_command("list_whitelist", rule=check_admin, priority=5)
+# ==================== 2. 机器人逻辑实现 ====================
 
-@list_whitelist.handle()
-async def handle_list_whitelist():
-    cfg = load_config()
-    whitelist = cfg.get("whitelist", [])
-    if not whitelist:
-        await list_whitelist.finish("空空如也。")
+_log = logging.get_logger()
+
+class ReviewBot(botpy.Client):
+    async def on_group_at_message_create(self, message: GroupMessage):
+        """
+        触发条件：仅在群聊中被 @机器人 时调用
+        """
+        data = load_data()
+        
+        # 获取发送消息用户的唯一标识 (OpenID)
+        sender_id = message.author.member_openid  
+        content = message.content.strip()
+
+        # 校验当前用户的权限
+        is_admin = sender_id in data.get("admins", [])
+        is_whitelisted = (sender_id in data.get("whitelist", [])) or is_admin
+
+        # 正则表达式匹配指令
+        add_wl_match = re.search(r"加白\s+(.+)", content)
+        del_wl_match = re.search(r"删白\s+(.+)", content)
+        add_rev_match = re.search(r"录入\s+(\S+)\s+(.+)", content)
+        query_rev_match = re.search(r"查询\s+(\S+)", content)
+        del_rev_match = re.search(r"删评\s+(\S+)\s+(\d+)", content)
+
+        # ---------------- 1. 管理员指令：添加白名单 ----------------
+        if add_wl_match:
+            if not is_admin:
+                await message.reply(content="❌ 权限不足：仅管理员可以添加白名单。")
+                return
+            
+            target_user = add_wl_match.group(1).strip()
+            if target_user not in data["whitelist"]:
+                data["whitelist"].append(target_user)
+                save_data(data)
+                await message.reply(content=f"✅ 已成功将用户 [{target_user}] 添加到白名单。")
+            else:
+                await message.reply(content=f"⚠️ 用户 [{target_user}] 已在白名单中。")
+            return
+
+        # ---------------- 2. 管理员指令：删除白名单 ----------------
+        if del_wl_match:
+            if not is_admin:
+                await message.reply(content="❌ 权限不足：仅管理员可以删除白名单。")
+                return
+            
+            target_user = del_wl_match.group(1).strip()
+            if target_user in data["whitelist"]:
+                data["whitelist"].remove(target_user)
+                save_data(data)
+                await message.reply(content=f"✅ 已成功将用户 [{target_user}] 移出白名单。")
+            else:
+                await message.reply(content=f"⚠️ 用户 [{target_user}] 不在白名单列表中。")
+            return
+
+        # ---------------- 权限拦截 ----------------
+        # 非白名单/非管理员用户无法使用接下来的所有功能
+        if not is_whitelisted:
+            await message.reply(content="❌ 您不在白名单中，暂无使用权限。")
+            return
+
+        # ---------------- 3. 白名单 & 管理员：录入账号评价 ----------------
+        if add_rev_match:
+            account = add_rev_match.group(1)
+            review_text = add_rev_match.group(2)
+
+            if account not in data["reviews"]:
+                data["reviews"][account] = []
+
+            # 追加评价记录（支持相同账号多次录入）
+            data["reviews"][account].append({
+                "by": sender_id,
+                "text": review_text
+            })
+            save_data(data)
+            await message.reply(content=f"✅ 账号 [{account}] 的评价录入成功！")
+            return
+
+        # ---------------- 4. 白名单 & 管理员：查询账号评价 ----------------
+        if query_rev_match:
+            account = query_rev_match.group(1)
+            reviews = data["reviews"].get(account, [])
+
+            if not reviews:
+                # 查不到时按需求精准返回
+                await message.reply(content="无评价录入")
+            else:
+                reply_msg = f"📋 账号 [{account}] 的评价记录（共 {len(reviews)} 条）：\n"
+                for idx, item in enumerate(reviews, 1):
+                    reply_msg += f"{idx}. {item['text']}\n"
+                await message.reply(content=reply_msg.strip())
+            return
+
+        # ---------------- 5. 仅管理员：删除某条评价 ----------------
+        if del_rev_match:
+            if not is_admin:
+                await message.reply(content="❌ 权限不足：白名单用户无法删除评价，仅管理员可删除。")
+                return
+
+            account = del_rev_match.group(1)
+            try:
+                index = int(del_rev_match.group(2)) - 1  # 用户输入的序号转为数组索引
+            except ValueError:
+                await message.reply(content="❌ 输入格式错误，评价序号必须是数字。")
+                return
+
+            reviews = data["reviews"].get(account, [])
+            
+            if not reviews or index < 0 or index >= len(reviews):
+                await message.reply(content=f"❌ 删除失败：找不到账号 [{account}] 的第 {index + 1} 条评价。")
+            else:
+                removed_item = reviews.pop(index)
+                # 若账号下的评价全部被删光，清空该账号键值
+                if not reviews:
+                    del data["reviews"][account]
+                save_data(data)
+                await message.reply(content=f"✅ 已成功删除账号 [{account}] 的第 {index + 1} 条评价。")
+            return
+
+
+# ==================== 3. 程序入口 ====================
+
+if __name__ == "__main__":
+    # 配置机器人监听的事件意图（公域/私域群消息）
+    intents = botpy.Intents(public_guild_messages=True)
     
-    text = "📋 当前白名单用户：\n" + "\n".join([f"{i}. {uid}" for i, uid in enumerate(whitelist, 1)])
-    await list_whitelist.finish(text)
+    client = ReviewBot(intents=intents)
+    
+    # 启动机器人
+    client.run(
+        appid=APP_ID, 
+        secret=APP_SECRET
+    )
